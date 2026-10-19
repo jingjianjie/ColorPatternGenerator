@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">ColorPatternGenerator</string>
+    <string name="accessibility_service_description">Enable Remote Desktop Control for ColorPatternGenerator.</string>
+</resources>

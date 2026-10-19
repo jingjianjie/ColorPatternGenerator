@@ -1,0 +1,30 @@
+# Gradle and Android build outputs
+.gradle/
+**/build/
+local.properties
+*.apk
+*.aab
+
+# Downloaded Android SDK and build tools (installed separately; see BUILD.md)
+/android-14/
+/aapt2_download/
+/aapt2-*.jar
+/build-tools_*.zip
+/META-INF/
+/NOTICE
+
+# Local machine configuration and backups
+/my_smb.conf
+/smb_append.txt
+/codex_backups/
+/.agents/
+/.codex/
+*.codex.bak.*
+*.bak
+*.bak.*
+
+# Editor and Python caches
+.idea/
+*.iml
+__pycache__/
+*.py[cod]
