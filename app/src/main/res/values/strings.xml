@@ -1,4 +1,21 @@
 <resources>
     <string name="app_name">ColorPatternGenerator</string>
     <string name="accessibility_service_description">Enable Remote Desktop Control for ColorPatternGenerator.</string>
+    <string name="update_check">Check for updates</string>
+    <string name="update_source">GitHub updates</string>
+    <string name="update_current_version">Installed version: %1$s</string>
+    <string name="update_checking">Checking GitHub for updates…</string>
+    <string name="update_working">Please wait…</string>
+    <string name="update_up_to_date">Version %1$s is up to date.</string>
+    <string name="update_available">Version %1$s is available (installed: %2$s).</string>
+    <string name="update_download">Download update</string>
+    <string name="update_downloading">Downloading update: %1$d%%</string>
+    <string name="update_ready">Update downloaded. Tap Install update to continue.</string>
+    <string name="update_install">Install update</string>
+    <string name="update_permission_title">Allow app updates</string>
+    <string name="update_permission_message">Allow ColorPatternGenerator to install apps on the next screen, then return here. Android will ask you to confirm the update.</string>
+    <string name="update_open_settings">Open settings</string>
+    <string name="update_install_permission_denied">Installation permission was not granted. Tap Install update to try again.</string>
+    <string name="update_installer_opened">Finish the update in the Android installer. If you cancelled, tap Install update to try again.</string>
+    <string name="update_error">%1$s</string>
 </resources>

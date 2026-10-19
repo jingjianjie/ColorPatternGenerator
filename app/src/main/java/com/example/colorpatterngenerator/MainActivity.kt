@@ -71,6 +71,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var positionOverlay: PositionOverlayView
     private lateinit var statusLogScroll: ScrollView
     private lateinit var statusLogText: TextView
+    private lateinit var updatePanel: View
+    private lateinit var appUpdateController: AppUpdateController
 
     // State
     private var circleSizePx = 300
@@ -160,7 +162,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
 
         FileLogger.init(this)
-        FileLogger.log("MainActivity", "App Started. Version 1.2")
+        FileLogger.log("MainActivity", "App Started. Version ${packageManager.getPackageInfo(packageName, 0).versionName}")
 
         setContentView(R.layout.activity_main)
         // Keep screen on at View level too
@@ -177,6 +179,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         circleContainer = findViewById(R.id.circleContainer)
         circleView = findViewById(R.id.circleView)
         imageView = findViewById(R.id.imageView)
+        updatePanel = findViewById(R.id.updatePanel)
+        appUpdateController = AppUpdateController(
+            this,
+            findViewById(R.id.checkUpdateButton),
+            findViewById(R.id.updateStatusText),
+            savedInstanceState
+        ) { !isTouchLocked && updatePanel.visibility == View.VISIBLE }
         
         // Refresh layout on orientation/size change
         frameLayout.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
@@ -422,6 +431,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         FileLogger.log("LOCK", "$message by $source")
         appendStatusLog("$message by $source")
         runOnUiThread {
+            appUpdateController.refreshButton()
             android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_SHORT).show()
         }
     }
@@ -549,6 +559,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // Legacy method redirection
     private fun updateCircleSizePx() {
         updateCircleLayout()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        appUpdateController.saveInstanceState(outState)
+        super.onSaveInstanceState(outState)
     }
 
     override fun onDestroy() {
@@ -841,6 +856,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     FileLogger.log("TCP", "Stream negotiated on port $port")
                     
                     withContext(Dispatchers.Main) {
+                        updatePanel.visibility = View.GONE
+                        appUpdateController.refreshButton()
                         val toast = android.widget.Toast.makeText(this@MainActivity, "Stream Starting...", android.widget.Toast.LENGTH_SHORT)
                         toast.show()
                         infoText.text = "Stream Ready on $port"
@@ -874,6 +891,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     isStreaming = false
                     currentPatternName = "None"
                     currentColorInfo = "N/A"
+                    withContext(Dispatchers.Main) {
+                        restoreCurrentPatternUi()
+                    }
                 } else {
                     FileLogger.log("TCP", "Ignored Stop from non-owner")
                 }
@@ -1025,6 +1045,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun enterPositionMode() {
+        updatePanel.visibility = View.GONE
+        appUpdateController.refreshButton()
         val cx = screenWidthMm / 2f
         val cy = screenHeightMm / 2f + (diskOffsetYPercent * (screenHeightMm / 2f))
         positionOverlay.setCenter(
@@ -1140,6 +1162,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun resetUi(except: View? = null) {
+        updatePanel.visibility = if ((except == null || except == infoText) &&
+            !isSleeping && !isStreaming && !isPositionMode) View.VISIBLE else View.GONE
+        appUpdateController.refreshButton()
         if (except != infoText) infoText.visibility = View.GONE
         if (except != infoText) statusLogScroll.visibility = View.GONE
         if (except != fullColorView) fullColorView.visibility = View.GONE
