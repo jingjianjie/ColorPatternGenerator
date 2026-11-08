@@ -11,6 +11,9 @@ sealed class Command {
     data class SetDiskProperty(val diameterMm: Float, val centerX: Float, val centerY: Float) : Command()
     object GetPositionAngle : Command()
     object GetStatus : Command()
+    object GetBrightnessSettleMs : Command()
+    data class SetBrightnessSettleMs(val delayMs: Long) : Command()
+    object InvalidBrightnessSettleMs : Command()
     object SetPositionMode : Command()
     object Sleep : Command()
     object Wake : Command()
@@ -28,13 +31,26 @@ class CommandParser {
             cmd == "reset_pos" -> Command.ResetPos
             cmd == "lock" -> Command.Lock
             cmd == "unlock" -> Command.Unlock
+            cmd == "get_brightness_settle_ms" -> Command.GetBrightnessSettleMs
+            cmd.startsWith("set_brightness_settle_ms") -> {
+                val delayMs = if (cmd.startsWith("set_brightness_settle_ms:")) {
+                    cmd.substringAfter(":").toLongOrNull()
+                } else null
+                if (delayMs != null && delayMs in 0L..60_000L) {
+                    Command.SetBrightnessSettleMs(delayMs)
+                } else {
+                    Command.InvalidBrightnessSettleMs
+                }
+            }
             cmd.startsWith("color=") -> {
                 val parts = cmd.substringAfter("=").split(",")
                 if (parts.size >= 3) {
                     val r = parts[0].toIntOrNull() ?: 0
                     val g = parts[1].toIntOrNull() ?: 0
                     val b = parts[2].toIntOrNull() ?: 0
-                    val brightness = if (parts.size >= 4) parts[3].toFloatOrNull()?.coerceIn(0.01f, 100.0f) else null
+                    val suppliedBrightness = if (parts.size >= 4) parts[3].toFloatOrNull() else null
+                    if (suppliedBrightness != null && !suppliedBrightness.isFinite()) return Command.Unknown
+                    val brightness = suppliedBrightness?.coerceIn(0.01f, 100.0f)
                     Command.SetColor(r, g, b, brightness)
                 } else Command.Unknown
             }
@@ -44,7 +60,9 @@ class CommandParser {
                     val r = parts[0].toIntOrNull() ?: 0
                     val g = parts[1].toIntOrNull() ?: 0
                     val b = parts[2].toIntOrNull() ?: 0
-                    val brightness = if (parts.size >= 4) parts[3].toFloatOrNull()?.coerceIn(0.01f, 100.0f) else null
+                    val suppliedBrightness = if (parts.size >= 4) parts[3].toFloatOrNull() else null
+                    if (suppliedBrightness != null && !suppliedBrightness.isFinite()) return Command.Unknown
+                    val brightness = suppliedBrightness?.coerceIn(0.01f, 100.0f)
                     Command.SetCircleColor(r, g, b, brightness)
                 } else Command.Unknown
             }

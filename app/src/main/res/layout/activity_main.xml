@@ -116,4 +116,13 @@
         android:layout_height="match_parent"
         android:visibility="gone" />
 
+    <!-- Idle standby stays above status logs without changing the selected pattern. -->
+    <View
+        android:id="@+id/idleSleepOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#000000"
+        android:importantForAccessibility="no"
+        android:visibility="gone" />
+
 </FrameLayout>

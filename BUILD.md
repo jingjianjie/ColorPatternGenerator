@@ -82,6 +82,11 @@ APK 可在共享目录中访问：
 本功能读取已发布的稳定 Release，不会把源码提交当作 APK 更新。尚无 Release 时会显示提示。
 首次使用此功能，需要先手动安装包含更新按钮的 APK（版本 1.1，versionCode 2）。
 
+当前版本为 **1.2（versionCode 3）**：等待页面空闲 30 秒自动黑屏低亮度待机；
+图案显示不受自动待机影响；屏幕方向遵循 Android 系统旋转设置。
+实际亮度改变后的 TCP 稳定等待默认为 3 秒，可用
+`set_brightness_settle_ms:3000` 配置，详见 `PROTOCOL.md`。
+
 发布后续更新：
 
 1. 在 `app/build.gradle` 中同时提高 `versionCode` 和 `versionName`。

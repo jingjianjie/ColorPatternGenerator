@@ -65,4 +65,59 @@ class CommandParserTest {
         val result = parser.parse("image:test.png")
         assertTrue(result is Command.Unknown)
     }
+
+    @Test
+    fun testParseBrightnessSettlingQuery() {
+        assertSame(Command.GetBrightnessSettleMs, parser.parse("get_brightness_settle_ms"))
+    }
+
+    @Test
+    fun testParseBrightnessSettlingBounds() {
+        for (delayMs in listOf(0L, 3_000L, 60_000L)) {
+            assertEquals(
+                Command.SetBrightnessSettleMs(delayMs),
+                parser.parse("set_brightness_settle_ms:$delayMs")
+            )
+        }
+    }
+
+    @Test
+    fun testRejectInvalidBrightnessSettlingValues() {
+        for (command in listOf(
+            "set_brightness_settle_ms",
+            "set_brightness_settle_ms:",
+            "set_brightness_settle_ms=-1",
+            "set_brightness_settle_ms:-1",
+            "set_brightness_settle_ms:60001",
+            "set_brightness_settle_ms:1.5",
+            "set_brightness_settle_ms:NaN",
+            "set_brightness_settle_ms:Infinity",
+            "set_brightness_settle_ms:3000:4000",
+            "set_brightness_settle_ms:9223372036854775808"
+        )) {
+            assertSame(command, Command.InvalidBrightnessSettleMs, parser.parse(command))
+        }
+    }
+
+    @Test
+    fun testRejectNonFiniteColorBrightness() {
+        for (prefix in listOf("color=", "color_o=")) {
+            for (brightness in listOf("NaN", "Infinity", "-Infinity", "1e99")) {
+                assertSame(
+                    "$prefix with $brightness",
+                    Command.Unknown,
+                    parser.parse("${prefix}1,2,3,$brightness")
+                )
+            }
+        }
+    }
+
+    @Test
+    fun testPreserveOptionalBrightnessAndFiniteClamping() {
+        assertEquals(Command.SetColor(1, 2, 3), parser.parse("color=1,2,3"))
+        assertEquals(Command.SetCircleColor(1, 2, 3), parser.parse("color_o=1,2,3"))
+        assertEquals(Command.SetColor(1, 2, 3, 50f), parser.parse("color=1,2,3,50"))
+        assertEquals(Command.SetColor(1, 2, 3, 0.01f), parser.parse("color=1,2,3,-10"))
+        assertEquals(Command.SetCircleColor(1, 2, 3, 100f), parser.parse("color_o=1,2,3,120"))
+    }
 }

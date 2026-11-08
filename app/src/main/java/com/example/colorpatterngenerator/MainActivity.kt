@@ -42,10 +42,12 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.Executors
 
@@ -73,18 +75,24 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var statusLogText: TextView
     private lateinit var updatePanel: View
     private lateinit var appUpdateController: AppUpdateController
+    private lateinit var idleSleepOverlay: View
+    private lateinit var idleSleepController: IdleSleepController
+    private var idleSavedBrightness = 1.0f
+    private var isActivityResumed = false
+    private var consumeIdleWakeGesture = false
 
     // State
     private var circleSizePx = 300
     private val UDP_PORT = 9999
     private var isTcpMode = false
-    private val activeTcpSockets = java.util.Collections.synchronizedList(mutableListOf<Socket>())
+    private val activeTcpSockets = TcpControllerConnections()
     private var streamTargetSocket: Socket? = null
     private var streamJob: Job? = null
     private val commandParser = CommandParser()
     private var streamStartTime = 0L
     private val MAX_STREAM_DURATION_MS = 24 * 60 * 60 * 1000L // 24 Hours
-    private val connectMutex = Mutex()
+    private val commandMutex = Mutex()
+    private val brightnessSettler = BrightnessSettler()
     private var isPositionMode = false
     private var currentPatternName = "None" // Tracks current pattern (Color, Disk, Image, Position)
     private var currentColorInfo = "0,0,0"  // Tracks RGB for Color/Disk
@@ -93,6 +101,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var gestureDetector: android.view.GestureDetector
     private var gestureAnalyzer: SimpleGestureAnalyzer? = null
     private var isStreaming = false
+    private var initializedCameraProvider: ProcessCameraProvider? = null
+    private var cameraSessionGeneration = 0L
     private var isSleeping = false
     private var isTouchLocked = false
     private var sleepSavedPatternState: PatternState? = null
@@ -180,12 +190,37 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         circleView = findViewById(R.id.circleView)
         imageView = findViewById(R.id.imageView)
         updatePanel = findViewById(R.id.updatePanel)
+        idleSleepOverlay = findViewById(R.id.idleSleepOverlay)
+        idleSleepController = IdleSleepController(
+            schedule = { callback, delayMs -> frameLayout.postDelayed(callback, delayMs) },
+            cancel = { callback -> frameLayout.removeCallbacks(callback) },
+            onSleep = {
+                idleSavedBrightness = window.attributes.screenBrightness
+                idleSleepOverlay.visibility = View.VISIBLE
+                idleSleepOverlay.bringToFront()
+                val attributes = window.attributes
+                attributes.screenBrightness = 0.01f
+                window.attributes = attributes
+                appUpdateController.refreshButton()
+                FileLogger.log("Idle", "Waiting screen asleep; network remains available")
+            },
+            onWake = {
+                val attributes = window.attributes
+                attributes.screenBrightness = idleSavedBrightness
+                window.attributes = attributes
+                idleSleepOverlay.visibility = View.GONE
+                appUpdateController.refreshButton()
+            }
+        )
         appUpdateController = AppUpdateController(
             this,
             findViewById(R.id.checkUpdateButton),
             findViewById(R.id.updateStatusText),
             savedInstanceState
-        ) { !isTouchLocked && updatePanel.visibility == View.VISIBLE }
+        ) {
+            !isTouchLocked && !idleSleepController.isSleeping &&
+                updatePanel.visibility == View.VISIBLE
+        }
         
         // Refresh layout on orientation/size change
         frameLayout.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
@@ -341,6 +376,24 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         RemoteDesktopServer.init(this)
     }
     
+    override fun dispatchTouchEvent(event: android.view.MotionEvent): Boolean {
+        if (::idleSleepController.isInitialized) {
+            if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN) {
+                consumeIdleWakeGesture = idleSleepController.isSleeping
+            }
+            idleSleepController.userActivity()
+            if (consumeIdleWakeGesture) {
+                if (event.actionMasked == android.view.MotionEvent.ACTION_UP ||
+                    event.actionMasked == android.view.MotionEvent.ACTION_CANCEL) {
+                    consumeIdleWakeGesture = false
+                }
+                // The first gesture wakes only; never click a hidden update/install button.
+                return true
+            }
+        }
+        return super.dispatchTouchEvent(event)
+    }
+
     override fun onTouchEvent(event: android.view.MotionEvent?): Boolean {
         if (event == null) return super.onTouchEvent(event)
 
@@ -462,6 +515,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     override fun onResume() {
         super.onResume()
+        isActivityResumed = true
+        idleSleepController.setForeground(hasWindowFocus())
         enableImmersiveMode()
         gravitySensor?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
         accelerometer?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
@@ -469,10 +524,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        if (::idleSleepController.isInitialized) {
+            idleSleepController.setForeground(isActivityResumed && hasFocus)
+        }
         if (hasFocus) enableImmersiveMode()
     }
 
     override fun onPause() {
+        isActivityResumed = false
+        idleSleepController.setForeground(false)
         super.onPause()
         sensorManager.unregisterListener(this)
     }
@@ -567,7 +627,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     override fun onDestroy() {
+        idleSleepController.close()
         super.onDestroy()
+        activeTcpSockets.close()
         multicastLock?.release()
     }
 
@@ -703,7 +765,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             if (parts.size >= 3) {
                 val targetIp = parts[1]
                 val targetPort = parts[2].toIntOrNull()
-                if (targetPort != null) {
+                if (targetIp.isNotBlank() && targetPort != null && targetPort in 1..65535) {
                     FileLogger.log("UDP", "Handshake received. Connecting to $targetIp:$targetPort")
                     showNetworkStatus("UDP handshake -> TCP connecting $targetIp:$targetPort")
                     connectTcp(targetIp, targetPort)
@@ -720,7 +782,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun connectTcp(ip: String, port: Int) {
-        // Launch in a new coroutine scope to allow multiple connections
+        // Each controller has its own socket and read loop, even when ports match.
         lifecycleScope.launch(Dispatchers.IO) {
             var socket: Socket? = null
             try {
@@ -732,20 +794,18 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 }
                 appendStatusLog("TCP connecting to $ip:$port", showPanel = true)
                 
-                socket = Socket(ip, port)
+                socket = Socket()
+                socket.connect(InetSocketAddress(ip, port), 5_000)
                 
-                // Deduplication: Remove existing connection from same IP
-                val existing = activeTcpSockets.find { 
-                    it.inetAddress.hostAddress == socket!!.inetAddress.hostAddress 
-                }
+                // Only reconnects to the exact same endpoint replace an existing session.
+                // Register first so the old reader cannot observe an empty connection set.
+                val existing = activeTcpSockets.add(socket)
                 if (existing != null) {
-                    FileLogger.log("TCP", "Closing duplicate connection from $ip")
-                    appendStatusLog("TCP closing duplicate connection from $ip")
+                    FileLogger.log("TCP", "Replacing connection to $ip:$port")
+                    appendStatusLog("TCP replacing connection to $ip:$port")
                     try { existing.close() } catch(e: Exception){}
-                    activeTcpSockets.remove(existing)
                 }
 
-                activeTcpSockets.add(socket)
                 isTcpMode = true
                 FileLogger.log("TCP", "Connected to $ip:$port. Total: ${activeTcpSockets.size}")
                 appendStatusLog("TCP connected to $ip:$port, total ${activeTcpSockets.size}", showPanel = true)
@@ -760,13 +820,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 
                 while (isActive && socket.isConnected) {
                     val line = readLineFromStream(inputStream) ?: break
-                    FileLogger.log("TCP", "Recv from $ip: $line")
-                    appendStatusLog("TCP recv $ip: $line")
+                    FileLogger.log("TCP", "Recv from $ip:$port: $line")
+                    appendStatusLog("TCP recv $ip:$port: $line")
                     handleTcpCommand(line, inputStream, socket)
                 }
                 
             } catch (e: Exception) {
-                FileLogger.e("PG", "TCP Error ($ip)", e)
+                FileLogger.e("PG", "TCP Error ($ip:$port)", e)
                 appendStatusLog("TCP error $ip:$port ${e.javaClass.simpleName}: ${e.message}", showPanel = true)
             } finally {
                 socket?.let { 
@@ -778,13 +838,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         appendStatusLog("TCP stream owner disconnected; stopping stream")
                         streamTargetSocket = null
                         StreamServer.stop()
-                        stopCameraStream()
-                        isStreaming = false
+                        withContext(Dispatchers.Main) {
+                            isStreaming = false
+                            if (currentPatternName == "CameraStream") {
+                                currentPatternName = "None"
+                                currentColorInfo = "N/A"
+                                isPositionMode = false
+                            }
+                            stopCameraStream()
+                        }
                     }
                 }
                 
-                FileLogger.log("TCP", "Disconnected $ip. Remaining: ${activeTcpSockets.size}")
-                appendStatusLog("TCP disconnected $ip. Remaining: ${activeTcpSockets.size}", showPanel = true)
+                FileLogger.log("TCP", "Disconnected $ip:$port. Remaining: ${activeTcpSockets.size}")
+                appendStatusLog("TCP disconnected $ip:$port. Remaining: ${activeTcpSockets.size}", showPanel = true)
                 
                 withContext(Dispatchers.Main) {
                     if (activeTcpSockets.isEmpty()) {
@@ -793,8 +860,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         
                         // Cleanup all streaming
                         StreamServer.stop()
-                        stopCameraStream()
                         isStreaming = false
+                        isPositionMode = false
+                        currentPatternName = "None"
+                        currentColorInfo = "N/A"
+                        stopCameraStream()
                         resetUi()
                         infoText.visibility = View.VISIBLE
                         statusLogScroll.visibility = View.VISIBLE
@@ -822,24 +892,55 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private suspend fun handleTcpCommand(cmdLine: String, input: InputStream, socket: Socket) {
-         when (val cmd = commandParser.parse(cmdLine)) {
+        val cmd = commandParser.parse(cmdLine)
+        // Receive uploads before taking the shared display gate: a slow sender must
+        // not block the other controllers while it transfers the image.
+        val imageBitmap = if (cmd is Command.ImageHeader) {
+            val imgData = ByteArray(cmd.size)
+            var totalRead = 0
+            while (totalRead < imgData.size) {
+                val read = input.read(imgData, totalRead, imgData.size - totalRead)
+                if (read == -1) throw java.io.EOFException("Incomplete image payload")
+                totalRead += read
+            }
+            requireNotNull(BitmapFactory.decodeByteArray(imgData, 0, imgData.size)) {
+                "Invalid image payload"
+            }
+        } else null
+
+        commandMutex.withLock {
+            // Shared by every TCP client. Suspending here keeps the main/UI thread free.
+            brightnessSettler.awaitReady()
+            applyTcpCommand(cmd, cmdLine, socket, imageBitmap)
+        }
+    }
+
+    // Called on Main while holding commandMutex. Keeping the before/apply/after
+    // snapshot in one UI turn prevents an idle timeout racing the brightness check.
+    private fun applyDisplayChange(change: () -> Unit) {
+        val previousBrightness = window.attributes.screenBrightness
+        change()
+        brightnessSettler.brightnessApplied(previousBrightness, window.attributes.screenBrightness)
+    }
+
+    private suspend fun applyTcpCommand(
+        cmd: Command,
+        cmdLine: String,
+        socket: Socket,
+        imageBitmap: android.graphics.Bitmap?
+    ) {
+         when (cmd) {
              is Command.ImageHeader -> {
-                 val size = cmd.size
-                 val imgData = ByteArray(size)
-                 var totalRead = 0
-                 while (totalRead < size) {
-                     val read = input.read(imgData, totalRead, size - totalRead)
-                     if (read == -1) break
-                     totalRead += read
-                 }
-                 val bitmap = BitmapFactory.decodeByteArray(imgData, 0, size)
                  withContext(Dispatchers.Main) {
+                   applyDisplayChange {
                      // Save current state to history before switching to image
                      historyManager.saveState(currentPatternName, currentColorInfo)
-                     
+                     isPositionMode = false
+                     exitPositionMode()
                      currentPatternName = "Image:${cmd.name}"
                      currentColorInfo = "N/A"
-                     showImage(bitmap)
+                     showImage(requireNotNull(imageBitmap))
+                   }
                  }
              }
              is Command.StreamStart -> {
@@ -856,21 +957,27 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     FileLogger.log("TCP", "Stream negotiated on port $port")
                     
                     withContext(Dispatchers.Main) {
+                      applyDisplayChange {
+                        // Streaming is active work even while its status panel is visible.
+                        isStreaming = true
+                        isPositionMode = false
+                        exitPositionMode()
+                        currentPatternName = "CameraStream"
+                        currentColorInfo = "N/A"
+                        idleSleepController.setIdle(false)
                         updatePanel.visibility = View.GONE
                         appUpdateController.refreshButton()
                         val toast = android.widget.Toast.makeText(this@MainActivity, "Stream Starting...", android.widget.Toast.LENGTH_SHORT)
                         toast.show()
                         infoText.text = "Stream Ready on $port"
                         infoText.visibility = View.VISIBLE
+                      }
                     }
                     
-                    // Enable streaming flag
-                    isStreaming = true
-                    currentPatternName = "CameraStream"
-                    currentColorInfo = "N/A"
-                    
                     // Start Camera Analysis
-                    startCameraStream()
+                    withContext(Dispatchers.Main) {
+                        startCameraStream()
+                    }
                 } else {
                     FileLogger.e("TCP", "Failed to start stream server")
                     val response = "stream_error:bind_failed\n"
@@ -887,12 +994,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 if (streamTargetSocket == socket) {
                     streamTargetSocket = null
                     StreamServer.stop()
-                    stopCameraStream()
-                    isStreaming = false
-                    currentPatternName = "None"
-                    currentColorInfo = "N/A"
                     withContext(Dispatchers.Main) {
-                        restoreCurrentPatternUi()
+                        isStreaming = false
+                        isPositionMode = false
+                        currentPatternName = "None"
+                        currentColorInfo = "N/A"
+                        stopCameraStream()
                     }
                 } else {
                     FileLogger.log("TCP", "Ignored Stop from non-owner")
@@ -954,14 +1061,30 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             is Command.GetStatus -> {
                 // Format: PatternName,Color(R,G,B),Pitch,Yaw,Diameter,PosPercentageY,Brightness
                 // PosPercentageY: -100% (Top) to 100% (Bottom). 0% is Center.
-                val percentY = diskOffsetYPercent * 100f
-                val brightness = (window.attributes.screenBrightness * 100f).coerceAtLeast(0f)
-                
-                // Return 0 for X (Center)
-                val response = "$currentPatternName,$currentColorInfo,${String.format("%.2f", pitch)},${String.format("%.2f", roll)},${String.format("%.2f", diskDiameterMm)},0.00,${String.format("%.2f", percentY)},${String.format("%.2f", brightness)}\n"
+                val response = withContext(Dispatchers.Main) {
+                    val percentY = diskOffsetYPercent * 100f
+                    val brightness = (window.attributes.screenBrightness * 100f).coerceAtLeast(0f)
+                    "$currentPatternName,$currentColorInfo,${String.format("%.2f", pitch)},${String.format("%.2f", roll)},${String.format("%.2f", diskDiameterMm)},0.00,${String.format("%.2f", percentY)},${String.format("%.2f", brightness)}\n"
+                }
                 withContext(Dispatchers.IO) {
                     socket.getOutputStream().write(response.toByteArray())
                 }
+            }
+            is Command.GetBrightnessSettleMs -> {
+                socket.getOutputStream().write(
+                    "brightness_settle_ms:${brightnessSettler.delayMs}\n".toByteArray()
+                )
+            }
+            is Command.SetBrightnessSettleMs -> {
+                brightnessSettler.configure(cmd.delayMs)
+                socket.getOutputStream().write(
+                    "brightness_settle_ms:${brightnessSettler.delayMs}\n".toByteArray()
+                )
+            }
+            is Command.InvalidBrightnessSettleMs -> {
+                socket.getOutputStream().write(
+                    "error:brightness_settle_ms_must_be_integer_0_to_60000\n".toByteArray()
+                )
             }
             is Command.Lock -> {
                 withContext(Dispatchers.Main) {
@@ -976,6 +1099,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             is Command.Sleep -> {
                 FileLogger.log("CMD", "Sleep Requested")
                 withContext(Dispatchers.Main) {
+                  applyDisplayChange {
+                    // Restore pre-idle brightness before saving the explicit sleep state.
+                    idleSleepController.setIdle(false)
                     if (!isSleeping) {
                         sleepSavedPatternState = PatternState(currentPatternName, currentColorInfo)
                         sleepSavedBrightness = window.attributes.screenBrightness.takeIf { it >= 0f } ?: 1.0f
@@ -995,12 +1121,18 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     
                     infoText.text = "Sleeping (Network Active)"
                     infoText.visibility = View.VISIBLE
+                  }
                 }
                 // We do NOT stop the TCP server.
             }
             is Command.Wake -> {
                 FileLogger.log("CMD", "Wake Requested")
                 withContext(Dispatchers.Main) {
+                  applyDisplayChange {
+                    if (!isSleeping) {
+                        idleSleepController.wake()
+                        return@applyDisplayChange
+                    }
                     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                     val params = window.attributes
                     params.screenBrightness = sleepSavedBrightness.coerceIn(0.01f, 1.0f)
@@ -1021,14 +1153,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         infoText.text = "Waked Up"
                         resetUi(infoText)
                     }
+                  }
                 }
             }
             is Command.SetPositionMode -> {
-                isPositionMode = true
-                currentPatternName = "PositionMode"
-                currentColorInfo = "N/A"
                 withContext(Dispatchers.Main) {
-                    enterPositionMode()
+                    applyDisplayChange {
+                        isPositionMode = true
+                        currentPatternName = "PositionMode"
+                        currentColorInfo = "N/A"
+                        enterPositionMode()
+                    }
                 }
             }
             else -> {
@@ -1039,12 +1174,16 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         exitPositionMode()
                     }
                 }
-                handleCommand(cmdLine)
+                // Await application on the UI thread before starting the settling clock.
+                withContext(Dispatchers.Main) {
+                    applyDisplayChange { handleCommand(cmdLine) }
+                }
             }
         }
     }
 
     private fun enterPositionMode() {
+        idleSleepController.setIdle(false)
         updatePanel.visibility = View.GONE
         appUpdateController.refreshButton()
         val cx = screenWidthMm / 2f
@@ -1071,6 +1210,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         runOnUiThread {
             when (cmd) {
                 is Command.SetColor -> {
+                idleSleepController.setIdle(false)
                 currentPatternName = "FullColor"
                 currentColorInfo = "${cmd.r},${cmd.g},${cmd.b}"
                 // Apply brightness if provided
@@ -1082,6 +1222,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 showFullColor(Color.rgb(cmd.r, cmd.g, cmd.b))
             }
             is Command.SetCircleColor -> {
+                idleSleepController.setIdle(false)
                 currentPatternName = "Disk"
                 currentColorInfo = "${cmd.r},${cmd.g},${cmd.b}"
                 // Apply brightness if provided
@@ -1131,6 +1272,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // REMOVED restoreState() as it is replaced by performUndo/Redo
 
     private fun restoreCurrentPatternUi() {
+        // History restoration and returning to idle must not retain an old mode flag.
+        isPositionMode = currentPatternName == "PositionMode"
         // Restore UI based on currentPatternName
         when {
             currentPatternName == "FullColor" -> {
@@ -1162,8 +1305,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun resetUi(except: View? = null) {
-        updatePanel.visibility = if ((except == null || except == infoText) &&
-            !isSleeping && !isStreaming && !isPositionMode) View.VISIBLE else View.GONE
+        val idle = (except == null || except == infoText) &&
+            !isSleeping && !isStreaming && !isPositionMode
+        idleSleepController.setIdle(idle)
+        updatePanel.visibility = if (idle) View.VISIBLE else View.GONE
         appUpdateController.refreshButton()
         if (except != infoText) infoText.visibility = View.GONE
         if (except != infoText) statusLogScroll.visibility = View.GONE
@@ -1193,6 +1338,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun startCameraStream() {
+        val generation = ++cameraSessionGeneration
         streamStartTime = System.currentTimeMillis()
         FileLogger.log("Camera", "Starting Camera Stream")
         // Ensure preview is attached but hidden/behind
@@ -1207,8 +1353,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
+            // A stop or newer start can arrive before CameraX finishes initializing.
+            if (generation != cameraSessionGeneration || !isStreaming || isDestroyed) {
+                return@addListener
+            }
             try {
                 val cameraProvider = cameraProviderFuture.get()
+                initializedCameraProvider = cameraProvider
                 
                 val preview = Preview.Builder().build()
                 preview.setSurfaceProvider(cameraPreview.surfaceProvider)
@@ -1268,16 +1419,21 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun stopCameraStream() {
-        try {
-            val provider = ProcessCameraProvider.getInstance(this).get()
-            provider.unbindAll()
-            FileLogger.log("Camera", "Camera Stopped")
-            runOnUiThread {
+        runOnUiThread {
+            cameraSessionGeneration++
+            try {
+                // Do not wait for CameraX initialization on Main. Pending starts
+                // are invalidated above; only an initialized provider can be bound.
+                initializedCameraProvider?.unbindAll()
+                FileLogger.log("Camera", "Camera Stopped")
+            } catch (e: Exception) {
+                FileLogger.e("Camera", "Camera stop failed", e)
+            } finally {
                 cameraPreview.visibility = View.GONE
                 // If stream stops, ensure we restore the pattern UI (in case it was hidden)
                 restoreCurrentPatternUi()
             }
-        } catch (e: Exception) {}
+        }
     }
 
     // REMOVED sendFrame method. Using StreamServer.sendFrame directly.
